@@ -66,5 +66,5 @@ def simulate_heston(
 
 
 def call_payoff(S, strike: float):
-    """European call on the spot (instrument 0). we shud replace with any G(S_0..S_T)."""
+## European call on the spot (instrument 0). we shud replace with any G(S_0..S_T)
     return torch.clamp(S[:, -1, 0] - strike, min=0.0)
