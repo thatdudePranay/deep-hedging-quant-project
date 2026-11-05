@@ -68,3 +68,20 @@ def simulate_heston(
 def call_payoff(S, strike: float):
 ## European call on the spot (instrument 0). we shud replace with any G(S_0..S_T)
     return torch.clamp(S[:, -1, 0] - strike, min=0.0)
+
+## Geometric Brownian Motion
+def simulate_gbm(n_paths, n_steps = 30, dt = 1/365, sigma = 0.2, S_init = 100):
+    Z = torch.randn((n_paths, n_steps))
+    incre = torch.cumsum(- sigma ** 2 * dt / 2 + sigma * dt ** 0.5 * Z, dim = 1)
+
+    # add a zero first column
+    zeros = torch.zeros((n_paths, 1))
+    incre = torch.cat([zeros, incre], dim = 1)
+
+    ## full path trajectories
+    S = S_init * torch.exp(incre)
+    return {"S": S.unsqueeze(-1),
+            "V": torch.full((n_paths, n_steps + 1), sigma ** 2),
+            "dt": dt,
+            "T": n_steps * dt}
+
