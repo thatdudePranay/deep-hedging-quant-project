@@ -1,0 +1,841 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\PL}{\mathrm{PL}}
+\newcommand{\CVaR}{\mathrm{CVaR}}
+\newcommand{\VaR}{\mathrm{VaR}}
+\newcommand{\sgn}{\operatorname{sgn}}
+\newcommand{\relu}{\operatorname{ReLU}}
+
+\title{Deep Hedging: A Walkthrough\\[4pt]
+\large From Neural Networks to Hedging Under Frictions}
+\author{Qianmo Liu}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+These notes build deep hedging (Buehler, Gonon, Teichmann and Wood, 2019) from scratch.
+We first explain why hedging in a realistic market is an optimization problem rather than
+a replication problem, then introduce the risk measures used as objectives, then the
+neural-network machinery, and finally put everything together into a training algorithm.
+The last sections cover the market simulators, benchmarks, expected results, and an
+implementation guide matched to the project repository. Each section states the
+technique first and then works through a concrete example.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%====================================================================
+\section{Setup and Notation}
+%====================================================================
+
+Throughout we work on a filtered probability space $(\Omega,\mathcal F,(\mathcal F_k)_{k=0}^n,\mathbb P)$
+with trading dates
+\[
+0=t_0<t_1<\cdots<t_n=T,\qquad t_k=k\,\Delta t .
+\]
+
+\begin{itemize}[leftmargin=*]
+  \item $S_k=(S_k^{(1)},\dots,S_k^{(m)})\in\R^m$: prices of the $m$ hedging instruments at $t_k$.
+  \item $Z$: the liability we are short, an $\mathcal F_n$-measurable random variable. Running example: a European call, $Z=(S^{(1)}_n-K)^+$. Note that this is very important for the hedging concept since as a seller, the loss is unbounded.
+  \item $\delta_k\in\R^m$: number of units of each instrument held over $[t_k,t_{k+1})$, chosen at $t_k$.
+        A strategy $\delta=(\delta_0,\dots,\delta_{n-1})$ is \emph{admissible} if each $\delta_k$ is
+        $\mathcal F_k$-measurable. We set $\delta_{-1}=\delta_n=0$ (start flat, liquidate at maturity).
+  \item Interest rate $r=0$. Every price is already in units of the bank account, so cash earns nothing.
+  \item Proportional transaction cost $c\ge 0$: trading $\Delta$ units at price $S$ costs $cS|\Delta|$.
+\end{itemize}
+
+\begin{definition}[Hedging P\&L]
+For an initial premium $p_0$ received for selling $Z$, the terminal profit and loss is
+\begin{equation}\label{eq:PL}
+\PL_T(\delta)
+= -Z + p_0
++ \underbrace{\sum_{k=0}^{n-1}\delta_k\cdot(S_{k+1}-S_k)}_{(\delta\cdot S)_T\ \text{(hedging gains)}}
+- \underbrace{\sum_{k=0}^{n}\sum_{j=1}^m c\,S^{(j)}_k\,\bigl|\delta^{(j)}_k-\delta^{(j)}_{k-1}\bigr|}_{C_T(\delta)\ \text{(trading costs)}} .
+\end{equation}
+\end{definition}
+
+\begin{remark}
+Equation~\eqref{eq:PL} yields a self-financing process: every cost is paid out of cash, and every gain or loss on the instruments accures to cash. 
+\end{remark}
+
+%====================================================================
+\section{Why Hedging Is an Optimization Problem}
+%====================================================================
+
+\subsection{Technique}
+
+In the Black--Scholes model with continuous trading and no costs, the market is \emph{complete}:
+there exist $p_0$ and $\delta$ with $\PL_T(\delta)=0$ almost surely, namely the BS price and
+$\delta_t=N(d_1)$. Replication fails as soon as any of the following holds:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Discrete trading.} The hedge is constant on $[t_k,t_{k+1})$, so that using $\delta_k$ shares of stocks to approximate the convex option value leaves a second-order error on each interval.
+$$\varepsilon_k \approx \tfrac12\,\Gamma_k\bigl[(\Delta S_k)^2-\sigma^2S_k^2\,\Delta t\bigr],
+  $$
+  which is of order $\Delta t$ with mean approximately zero. Summing $n=T/\Delta t$ such roughly independent errors gives a total hedging error with standard deviation of order $\sqrt{n}\,\Delta t=\sqrt{T\Delta t}$. The error vanishes only in the limit $\Delta t\to0$.
+  \item \textbf{Transaction costs.} Continuous delta hedging has infinite total variation, so its cost is infinite. Hence this disagrees with the conclusion above. 
+  \item \textbf{Untraded risk factors.} Under Heston with only the stock traded, volatility risk cannot be completely hedged. 
+\end{enumerate}
+
+When replication is impossible, there is no ``correct'' hedge. We must instead pick a criterion that
+ranks the random outcomes $\PL_T(\delta)$, and optimize it:
+\begin{equation}\label{eq:main}
+\pi(-Z)\;=\;\inf_{\delta\ \text{admissible}}\ \rho\bigl(-Z+(\delta\cdot S)_T-C_T(\delta)\bigr),
+\end{equation}
+where $\rho$ is a risk measure (Section~\ref{sec:risk}), and $\pi(-Z)$ denote how much cash must be added to $X$ under the optimal hedging to make the position acceptable.
+
+\subsection{Example: a one-period trinomial market}
+
+Let $S_0=100$, $S_1\in\{90,100,110\}$ with probability $1/3$ each, $K=100$, no costs.
+Then $Z\in\{0,0,10\}$.
+
+\paragraph{No replication.} We would need $p_0+\delta(S_1-100)=Z$ in every state:
+\[
+p_0-10\delta=0,\qquad p_0=0,\qquad p_0+10\delta=10 .
+\]
+The first two equations give $p_0=\delta=0$, which contradicts the third. Three states, two unknowns.
+
+\paragraph{Quadratic-optimal hedge.} Minimize $\E[(p_0+\delta\Delta S-Z)^2]$ with $\Delta S=S_1-S_0$.
+This is a linear regression of $Z$ on $\Delta S$:
+\[
+\delta^*=\frac{\operatorname{Cov}(Z,\Delta S)}{\operatorname{Var}(\Delta S)}
+=\frac{\tfrac13(10\cdot 10)}{\tfrac13(100+0+100)}=\frac12,
+\qquad p_0^*=\E[Z]=\frac{10}{3}.
+\]
+The residual $\PL$ is $\{-\tfrac53,\ \tfrac{10}{3},\ -\tfrac53\}$, with variance $\tfrac{50}{9}$.
+This variance is the irreducible, unhedgeable risk. A different $\rho$ (for instance CVaR) would penalize the
+three outcomes differently and give a different $\delta^*$.
+
+Deep hedging does exactly this, but with many periods, many instruments, and frictions,
+where no closed-form regression exists.
+
+%====================================================================
+\section{Risk Measures}\label{sec:risk}
+%====================================================================
+
+\subsection{Technique}
+
+\begin{definition}[Convex risk measure]
+A map $\rho$ from random variables (P\&Ls) to $\R$ is a \emph{convex risk measure} if for all $X,Y$:
+\begin{enumerate}[label=(\roman*)]
+  \item Monotonicity: $X\le Y \Rightarrow \rho(X)\ge\rho(Y)$. More profit means less risk.
+  \item Convexity: $\rho(\lambda X+(1-\lambda)Y)\le\lambda\rho(X)+(1-\lambda)\rho(Y)$ for $\lambda\in[0,1]$. Diversification does not increase risk.
+  \item Cash invariance: $\rho(X+c)=\rho(X)-c$ for constants $c$. Adding cash reduces risk one-for-one.
+\end{enumerate}
+\end{definition}
+
+Cash invariance means $\rho(X)$ is the smallest amount of cash that must be added to $X$ to make the position acceptable. There are three objectives used in the project:
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.6}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Name & Formula & Comment\\
+\midrule
+Quadratic & $\E[X^2]$ & Not a risk measure. Penalizes gains and losses equally.\\
+Entropic & $\rho_\lambda(X)=\tfrac1\lambda\log\E\bigl[e^{-\lambda X}\bigr]$ & Exponential utility. $\lambda>0$ is risk aversion.\\
+$\CVaR_\alpha$ & $\displaystyle \min_{w\in\R}\Bigl\{w+\tfrac{1}{1-\alpha}\E\bigl[(-X-w)^+\bigr]\Bigr\}$ & Mean of the worst $(1-\alpha)$ fraction of losses.\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{CVaR as an optimization: the Rockafellar--Uryasev trick}
+
+The naive definition of CVaR requires sorting the sample to find the $\alpha$-quantile, which is
+awkward to differentiate. The following representation turns it into a smooth-enough minimization.
+
+\begin{proposition}[Rockafellar--Uryasev]
+Let $L=-X$ be the loss, with continuous distribution. Define
+\[
+G(w)=w+\frac{1}{1-\alpha}\E\bigl[(L-w)^+\bigr].
+\]
+Then $G$ is convex, it is minimized at $w^*=\VaR_\alpha(L)$ (the $\alpha$-quantile of $L$), and
+\[
+\min_w G(w)=\E\bigl[L\,\big|\,L\ge\VaR_\alpha(L)\bigr]=\CVaR_\alpha(X).
+\]
+\end{proposition}
+
+\begin{proof}
+$G$ is convex because $w\mapsto(L-w)^+$ is convex and expectation preserves convexity. Differentiating,
+\[
+G'(w)=1-\frac{1}{1-\alpha}\,\mathbb P(L>w),
+\]
+which is zero exactly when $\mathbb P(L>w)=1-\alpha$, i.e.\ $w^*=\VaR_\alpha(L)$. Substituting $w^*$:
+\[
+G(w^*)=w^*+\frac{\E[(L-w^*)\mathbf 1\{L>w^*\}]}{\mathbb P(L>w^*)}
+=w^*+\E[L-w^*\mid L>w^*]=\E[L\mid L>w^*]. \qedhere
+\]
+\end{proof}
+
+\begin{remark}[Why this matters for deep hedging]
+Since $\CVaR_\alpha(X)=\min_w G(w)$, minimizing CVaR over the strategy is the same as
+\[
+\min_{\theta}\ \min_w\ G_\theta(w)=\min_{(\theta,w)}G_\theta(w).
+\]
+So $w$ becomes \emph{one extra trainable scalar}, optimized jointly with the network weights $\theta$ by the same
+gradient method. At the optimum, $w$ is the VaR of the hedged position, which is useful as a free diagnostic.
+\end{remark}
+
+\begin{example}[CVaR by hand]
+Five equally likely losses $L\in\{-1,0,2,3,6\}$, $\alpha=0.6$. The worst $40\%$ are $\{3,6\}$, so $\CVaR=4.5$.
+Using $G$, with $\tfrac1{1-\alpha}=2.5$:
+\begin{align*}
+G(2)&=2+2.5\cdot\tfrac15(0+0+0+1+4)=4.5,\\
+G(3)&=3+2.5\cdot\tfrac15(0+0+0+0+3)=4.5,\\
+G(4)&=4+2.5\cdot\tfrac15(0+0+0+0+2)=5.0 .
+\end{align*}
+The minimum is $4.5$, as expected. With a discrete sample, $G$ is flat between neighboring order statistics.
+The sample has only 5 points, so this is an extreme case of the same effect that makes small batches
+noisy in training: the CVaR gradient only comes from the $(1-\alpha)B$ worst paths.
+\end{example}
+
+\subsection{Entropic risk}
+
+$\rho_\lambda(X)=\frac1\lambda\log\E[e^{-\lambda X}]$ is cash invariant:
+$\rho_\lambda(X+c)=\frac1\lambda\log\bigl(e^{-\lambda c}\E[e^{-\lambda X}]\bigr)=\rho_\lambda(X)-c$.
+For $X\sim N(\mu,s^2)$ it equals $-\mu+\tfrac{\lambda}{2}s^2$, which makes the trade-off between
+mean and variance explicit. In practice, $e^{-\lambda X}$ overflows easily, so compute it with
+\texttt{torch.logsumexp(-lam*X, 0) - log(B)}, divided by $\lambda$.
+
+\subsection{Indifference pricing}
+
+\begin{definition}[Indifference price]
+Let $\pi$ be defined as in \eqref{eq:main}. The seller's \emph{indifference price} of $Z$ is
+\[
+p_0(Z) \;=\; \pi(-Z) - \pi(0).
+\]
+\end{definition}
+
+\begin{remark}[Interpretation]
+Compare the seller's optimal risk in two situations:
+\begin{itemize}
+  \item \textbf{Sell $Z$ for a premium $p$ and hedge optimally.} By cash invariance, the optimal risk is $\pi(-Z) - p$, which decreases one-for-one in $p$.
+  \item \textbf{Do not sell, and only trade the hedging instruments.} The optimal risk is $\pi(0)$, which does not depend on $p$.
+\end{itemize}
+$p_0(Z)$ is the unique premium that makes the two risks equal:
+\[
+\pi(-Z) - p_0 = \pi(0) \quad\Longleftrightarrow\quad p_0 = \pi(-Z) - \pi(0).
+\]
+The seller is therefore indifferent between selling and not selling at $p = p_0(Z)$. Selling is preferable if $p > p_0(Z)$, and not selling is preferable if $p < p_0(Z)$. Thus $p_0(Z)$ is the minimum acceptable premium. It assumes the seller hedges with the optimal strategy, and it depends on the chosen $\rho$ and on the market model.
+\end{remark}
+
+\begin{remark}[The benchmark $\pi(0)$]
+Since $\delta \equiv 0$ is admissible and $\rho(0) = 0$, we always have $\pi(0) \le 0$. Trading may reduce risk further when the instruments have nonzero expected returns under $\mathbb P$.
+
+If $S$ is a $\mathbb P$-martingale and there are no transaction costs, then $\mathbb E[(\delta\cdot S)_T] = 0$ for every admissible $\delta$. For the risk measures used here, $\rho(X) \ge -\mathbb E[X]$, so $\pi(0) \ge 0$, and hence $\pi(0) = 0$. With proportional costs, trading only adds a nonpositive term, so $\pi(0) = 0$ still holds. In this setting $p_0(Z) = \pi(-Z)$.
+\end{remark}
+
+\begin{proposition}[The premium drops out]
+If $\rho$ is cash invariant, then for any constant $p_0$
+\[
+\arg\min_\delta\rho\bigl(p_0-Z+(\delta\cdot S)_T-C_T(\delta)\bigr)=\arg\min_\delta\rho\bigl(-Z+(\delta\cdot S)_T-C_T(\delta)\bigr).
+\]
+\end{proposition}
+
+\begin{proof}
+By cash invariance, the left objective equals the right objective minus $p_0$, a constant that does not depend on $\delta$.
+\end{proof}
+
+So under entropic risk or CVaR we train \emph{without} a premium, and get the price afterwards from two training runs:
+one with $Z$ and one with $Z=0$.
+
+\begin{remark}[Quadratic loss]
+$\E[X^2]$ is not cash invariant, so the premium matters. Make $p_0$ a trainable scalar: minimizing
+$\E[(p_0+Y)^2]$ over $p_0$ gives $p_0=-\E[Y]$, so the remaining objective is $\operatorname{Var}(Y)$.
+In the trinomial example above, this is exactly why $p_0^*=\E[Z]$.
+\end{remark}
+
+%====================================================================
+\section{Neural Networks}\label{sec:nn}
+%====================================================================
+
+\subsection{From linear regression to an MLP}
+
+\paragraph{Linear model.} $\hat y=w^\top x+b$, fitted by minimizing $L(w,b)=\frac1N\sum_i(\hat y_i-y_i)^2$.
+Instead of the normal equations, we can use \emph{gradient descent}:
+\[
+\theta\leftarrow\theta-\eta\,\nabla_\theta L(\theta),\qquad \theta=(w,b),\ \eta>0 \text{ the learning rate.}
+\]
+A neural network replaces the linear function with a more flexible one. The fitting method is unchanged.
+
+\begin{proposition}[Steepest descent direction]
+Let $L:\mathbb R^p\to\mathbb R$ be differentiable at $\theta$ with $\nabla L(\theta)\neq 0$. Among all unit directions $u$ ($\|u\|=1$), the directional derivative
+\[
+D_uL(\theta)=\lim_{h\downarrow 0}\frac{L(\theta+hu)-L(\theta)}{h}=\nabla L(\theta)\cdot u
+\]
+is maximized by $u^*=\nabla L(\theta)/\|\nabla L(\theta)\|$ and minimized by $-u^*$, with extreme values $\pm\|\nabla L(\theta)\|$.
+\end{proposition}
+
+\begin{proof}
+By the Cauchy--Schwarz inequality,
+\[
+-\|\nabla L(\theta)\|=-\|\nabla L(\theta)\|\,\|u\|\;\le\;\nabla L(\theta)\cdot u\;\le\;\|\nabla L(\theta)\|\,\|u\|=\|\nabla L(\theta)\|,
+\]
+with equality on the right if and only if $u$ is a positive multiple of $\nabla L(\theta)$, and on the left if and only if $u$ is a negative multiple. \qedhere
+\end{proof}
+
+\begin{remark}[Gradient descent]
+The proposition motivates the update
+\[
+\theta\leftarrow\theta-\eta\,\nabla L(\theta),\qquad \eta>0,
+\]
+which moves in the locally steepest descent direction. By a first-order Taylor expansion,
+\[
+L\bigl(\theta-\eta\nabla L(\theta)\bigr)=L(\theta)-\eta\,\|\nabla L(\theta)\|^2+o(\eta),
+\]
+so the loss decreases for sufficiently small $\eta$. The guarantee is only local: if $\eta$ is too large, the $o(\eta)$ term dominates and the loss may increase. To maximize an objective, apply the same update to its negative.
+\end{remark}
+\paragraph{Why nonlinearity is needed.} Stacking linear maps gives a linear map:
+\[
+W_2(W_1x+b_1)+b_2=(W_2W_1)x+(W_2b_1+b_2).
+\]
+So we insert an elementwise nonlinearity $\sigma$ after each layer, and this $\sigma$ function is referred to as \textit{the activation function}. The standard choice is
+$\relu(z)=\max(z,0)$. A smooth alternative is $\operatorname{SiLU}(z)=z/(1+e^{-z})$.
+
+\begin{definition}[Multilayer perceptron]
+An MLP with $L$ hidden layers of widths $h_1,\dots,h_L$ is
+\[
+a_0=x,\qquad a_\ell=\sigma(W_\ell a_{\ell-1}+b_\ell)\ \ (\ell=1,\dots,L),\qquad F_\theta(x)=W_{L+1}a_L+b_{L+1},
+\]
+with $W_\ell\in\R^{h_\ell\times h_{\ell-1}}$, $b_\ell\in\R^{h_\ell}$, $h_0=d$ (input dimension), $h_{L+1}=m$ (output dimension).
+The parameter vector is $\theta=(W_1,b_1,\dots,W_{L+1},b_{L+1})$. The output layer has no activation.
+\end{definition}
+
+\begin{example}[Counting parameters]
+Input $d=3$, two hidden layers of width $64$, output $m=1$:
+\[
+\underbrace{64\cdot3+64}_{256}+\underbrace{64\cdot64+64}_{4160}+\underbrace{1\cdot64+1}_{65}=4481 .
+\]
+Each neuron has one weight per input plus one bias. Most parameters sit in the $64\times64$ middle layer.
+\end{example}
+
+\begin{theorem}[Universal approximation, informal; Hornik 1991]
+Let $\sigma$ be continuous and non-polynomial. For every continuous $f$ on a compact set $\mathcal K\subset\R^d$
+and every $\varepsilon>0$, there is a one-hidden-layer network $F_\theta$ with
+$\sup_{x\in\mathcal K}|F_\theta(x)-f(x)|<\varepsilon$.
+\end{theorem}
+
+This is the reason a network can stand in for an unknown hedging rule: whatever the optimal
+$\delta_k=f^*_k(I_k)$ is, a large enough network can approximate it. The theorem says nothing about
+how to \emph{find} $\theta$; that is the job of training.
+
+\subsection{Training: stochastic gradients}
+
+\paragraph{The problem.} In most cases the loss is an expectation, $L(\theta)=\mathbb E[\ell(\theta;\xi)]$, with $\xi$ random: a data point drawn uniformly from a finite dataset (so that the expectation is the dataset average), or in deep hedging a simulated path. This holds for the quadratic loss and for CVaR in the Rockafellar--Uryasev form; entropic risk is a nonlinear function of an expectation.
+
+For a large dataset, computing this average at every step is expensive.
+In deep hedging, $\xi$ ranges over infinitely many paths, so the exact gradient cannot be computed at all.
+
+\paragraph{The idea.} At each step, draw a \emph{mini-batch} $\xi_1,\dots,\xi_B$ of $B$ samples (the \emph{batch size}) and replace the
+expectation by a Monte Carlo average:
+\[
+\widehat{\nabla L}(\theta)=\frac1B\sum_{i=1}^B\nabla_\theta\ell(\theta;\xi_i),\qquad
+\theta_{k+1}\leftarrow\theta_{k}-\eta_k\,\widehat{\nabla L}(\theta_k).
+\]
+Since $\mathbb E\bigl[\widehat{\nabla L}(\theta)\bigr]=\nabla L(\theta)$, each step moves in the correct direction on average, with zero-mean noise.
+This is \emph{stochastic gradient descent (SGD)}.
+
+\paragraph{Terminology.} One parameter update is a \emph{step} (or \emph{iteration}). With a fixed dataset of $N$ points, shuffled and split
+into mini-batches, one pass through all the data is an \emph{epoch}, consisting of $N/B$ steps.
+
+\begin{example}[Full-batch vs.\ mini-batch]
+Data $x=\{1,2,3,4,5,6\}$, $L(\theta)=\frac16\sum_i(\theta-x_i)^2$, minimized at $\theta^*=\bar x=3.5$.
+The gradient of a batch is $2(\theta-\text{batch mean})$. Start at $\theta_0=0$ with $\eta=0.25$.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}c|ccc|ccc@{}}
+\toprule
+ & \multicolumn{3}{c|}{Full batch (all 6 points)} & \multicolumn{3}{c}{Mini-batch, $B=2$}\\
+Step & mean & gradient & $\theta$ & batch & gradient & $\theta$\\
+\midrule
+1 & 3.5 & $-7$ & 1.75 & $\{5,1\}$ & $-6$ & 1.5\\
+2 & 3.5 & $-3.5$ & 2.625 & $\{6,2\}$ & $-5$ & 2.75\\
+3 & 3.5 & $-1.75$ & 3.0625 & $\{3,4\}$ & $-1.5$ & 3.125\\
+\bottomrule
+\end{tabular}
+\end{center}
+Both approach $3.5$ at a similar rate, but each mini-batch step uses a third of the data. The batch means ($3$, $4$, $3.5$)
+differ from $3.5$, so individual steps are biased in direction, but the errors average out. The three steps form one epoch.
+\end{example}
+
+\paragraph{Does the noise average out?} Yes, but only partly. With a constant step size $\eta$, SGD reaches a neighbourhood of the minimizer and then keeps fluctuating inside it, because every step adds fresh noise. A smaller $\eta$ gives smaller fluctuations. To converge exactly, the step size must shrink over time (for example $\eta_k\propto1/k$). In practice we use a constant $\eta$ and lower it once the loss stops improving. A classical result going back to Robbins and Monro (1951) states that if $L$ is strongly convex, the gradient noise has bounded variance, and $\sum_k\eta_k=\infty$, $\sum_k\eta_k^2<\infty$, then SGD converges to the minimizer almost surely.
+
+
+\begin{remark}[Neural networks]
+For a neural network, $L$ is not convex. Theory then only guarantees convergence to points where $\nabla L\approx0$, which may be local
+minima or saddle points. That SGD finds good solutions for wide networks is largely an empirical fact. The gradient noise can even help,
+by pushing the iterates out of poor local minima.
+\end{remark}
+
+\paragraph{Adam.} Plain SGD uses a single step size $\eta_k$ for all coordinates of $\theta$ at step $k$. This is a problem when the gradient
+components have very different magnitudes: with gradient components $100$ and $0.01$ and $\eta=10^{-3}$, SGD moves the first coordinate
+by $0.1$ (possibly overshooting) and the second by $10^{-5}$ (essentially frozen). Adam (Kingma and Ba, 2015) fixes this by giving each
+coordinate its own effective step size.
+
+For each coordinate $j$, Adam keeps exponential moving averages of the gradient and of its square. With $g_k=\widehat{\nabla L}(\theta_k)$
+and all operations taken coordinatewise,
+\begin{align*}
+m_k&=\beta_1\,m_{k-1}+(1-\beta_1)\,g_k, &\hat m_k&=\frac{m_k}{1-\beta_1^k},\\
+v_k&=\beta_2\,v_{k-1}+(1-\beta_2)\,g_k^2, &\hat v_k&=\frac{v_k}{1-\beta_2^k},\\
+\theta_{k+1}&=\theta_k-\eta\,\frac{\hat m_k}{\sqrt{\hat v_k}+\epsilon},
+\end{align*}
+with $m_0=v_0=0$ and standard defaults $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$. The factors $1-\beta^k$ correct the bias
+toward $0$ caused by initializing the averages at $0$; they matter only in the first few hundred steps.
+
+\begin{itemize}
+  \item $\hat m_k$ (\emph{momentum}) averages recent gradients, so zero-mean noise partly cancels and a consistent direction remains.
+  \item Dividing by $\sqrt{\hat v_k}$ normalizes each coordinate by its typical gradient size, so the step is roughly $\eta$ per coordinate
+        regardless of scale.
+\end{itemize}
+
+
+
+In practice Adam needs little tuning: $\eta=10^{-3}$ is a good default, lowered to $10^{-4}$ once the loss plateaus. In deep hedging this is
+especially useful because the network weights and the CVaR threshold $w$ live on different scales, and Adam adapts to both automatically.
+
+\paragraph{In deep hedging.}
+\begin{itemize}
+  \item Each step simulates $B$ fresh paths, which form the mini-batch, and discards them afterwards. There is no fixed dataset, hence no epochs;
+        we count steps only. Because the network never sees the same path twice, overfitting is not a concern.
+  \item For CVaR in the Rockafellar--Uryasev form, the loss is an expectation for fixed $w$, so the mini-batch gradient is unbiased. But only the
+        worst $(1-\alpha)B$ paths contribute to it, so $B$ must be large (e.g.\ $B\ge10^4$ for $\alpha=0.95$).
+  \item For entropic risk, the loss $\frac1\lambda\log\mathbb E[e^{-\lambda X}]$ is not linear in the expectation, so the mini-batch gradient is
+        slightly biased. The bias vanishes as $B\to\infty$ and is negligible at $B=10^4$.
+  \item The training loss keeps fluctuating at the end of training. This is the constant-step-size effect above, not a failure to converge.
+        Judge progress on a fixed test set, and reduce $\eta$ for the final phase.
+\end{itemize}
+
+\subsection{Backpropagation}
+
+Gradients are computed by the chain rule, applied automatically (\emph{autograd}). The forward pass
+records every operation; \texttt{loss.backward()} traverses the record in reverse and multiplies local derivatives.
+
+\begin{example}[Backprop by hand]
+$f(x)=w_2\relu(w_1x)$, loss $L=(f-y)^2$, with $x=1$, $w_1=2$, $w_2=3$, $y=5$.
+
+\emph{Forward:} $u=w_1x=2$, $h=\relu(u)=2$, $f=w_2h=6$, $L=1$.
+
+\emph{Backward:}
+\[
+\frac{\partial L}{\partial f}=2(f-y)=2,\qquad
+\frac{\partial L}{\partial w_2}=\frac{\partial L}{\partial f}\,h=4,\qquad
+\frac{\partial L}{\partial w_1}=\frac{\partial L}{\partial f}\,w_2\,\mathbf 1\{u>0\}\,x=6 .
+\]
+A gradient step with $\eta=0.01$ gives $w_1=1.94$, $w_2=2.96$, so $f=5.74$ and $L\approx0.55$: the loss decreased.
+\end{example}
+
+The consequence for us: \textbf{any quantity computed from $\theta$ by differentiable tensor operations
+can be minimized}, including a P\&L built by a 30-step loop. We never write a derivative by hand.
+
+\subsection{Practical rules}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Scale inputs to $O(1)$.} Feed $\log(S/K)$, not $S\approx100$. Badly scaled inputs saturate or stall training.
+  \item \textbf{Learning rate.} Loss oscillates or explodes: too large. Loss barely moves: too small.
+  \item \textbf{Overfitting} (train loss down, validation loss up) is almost impossible here, because every step uses fresh simulated paths. Still evaluate on a fixed test set, which makes numbers comparable across runs.
+  \item \textbf{No dropout, no half precision.} Dropout makes the hedge random; float16 adds noise in exactly the tail that CVaR cares about.
+\end{itemize}
+
+%====================================================================
+\section{Deep Hedging}\label{sec:dh}
+%====================================================================
+
+\subsection{From strategies to networks}
+
+\paragraph{Step 1: strategies as feedback rules.}
+An admissible $\delta_k$ is a function of the information at $t_k$. In a Markov model, the relevant
+information is a low-dimensional state $I_k$, and we look for $\delta_k=f(I_k)$.
+
+\paragraph{Step 2: choice of state.}
+\begin{center}\small
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Setting & State $I_k$ & Reason\\
+\midrule
+GBM, no costs & $\bigl(\log\tfrac{S_k}{K},\ T-t_k\bigr)$ & BS delta depends only on these.\\
+GBM, costs & add $\delta_{k-1}$ & The optimal trade depends on the current position.\\
+Heston, two instruments & add $V_k/b$ and $\delta_{k-1}\in\R^2$ & Variance is a state variable.\\
+\bottomrule
+\end{tabular}
+\end{center}
+Including $\delta_{k-1}$ is not optional with costs. With $c>0$ the state of the hedging problem is
+(market state, current holdings), because the cost of moving to a target depends on where you are now.
+
+\paragraph{Step 3: one network for all dates.}
+\[
+\delta_k=F_\theta(I_k),\qquad k=0,\dots,n-1,
+\]
+with the same $\theta$ at every step; the date enters through $T-t_k$. (The original paper uses a
+separate network per date. Sharing is simpler, has $n$ times fewer parameters, and works well.)
+
+\paragraph{Step 4: the training problem.} Replace the infimum over all admissible strategies by an infimum
+over $\theta$, and the expectation by a Monte Carlo average over $B$ simulated paths:
+\begin{equation}\label{eq:train}
+\min_{\theta\,(,w)}\ \hat\rho\Bigl(\PL_T^{(1)}(\theta),\dots,\PL_T^{(B)}(\theta)\Bigr).
+\end{equation}
+For CVaR, $\hat\rho=w+\frac{1}{(1-\alpha)B}\sum_i(-\PL^{(i)}_T-w)^+$.
+
+\begin{theorem}[Approximation; Buehler et al.\ 2019, informal]
+If the networks are allowed to grow, the optimal value of the network-restricted problem converges to the
+optimal value $\pi(-Z)$ over all admissible strategies.
+\end{theorem}
+
+So restricting to networks loses nothing in the limit. The remaining errors are finite network size,
+finite sample size, and imperfect optimization, and we check them empirically against benchmarks.
+
+\subsection{The rollout}
+
+The network is called \emph{sequentially} along each path, and its output at step $k$ is an input at
+step $k+1$. In recursive form, with $\PL$ accumulated as we go:
+\begin{align*}
+&\PL\leftarrow p_0-Z,\qquad \delta_{-1}\leftarrow0,\\
+&\text{for }k=0,\dots,n-1:\quad
+\delta_k=F_\theta(I_k),\quad
+\PL\leftarrow\PL+\delta_k\cdot(S_{k+1}-S_k)-c\,S_k\cdot|\delta_k-\delta_{k-1}|,\\
+&\PL\leftarrow\PL-c\,S_n\cdot|\delta_{n-1}|\qquad\text{(liquidation).}
+\end{align*}
+
+\begin{example}[Two-step rollout by hand]
+$K=100$, $c=0.1\%$, path $S_0=100\to S_1=102\to S_2=99$. Suppose the network outputs $\delta_0=0.5$, $\delta_1=0.6$.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+$k$ & $S_k$ & $\delta_k$ & trade & cost $c\,S_k|\text{trade}|$ & gain $\delta_k(S_{k+1}-S_k)$\\
+\midrule
+0 & 100 & 0.5 & $+0.5$ & $0.0500$ & $0.5\cdot(+2)=+1.0$\\
+1 & 102 & 0.6 & $+0.1$ & $0.0102$ & $0.6\cdot(-3)=-1.8$\\
+2 & 99 & $0$ (liquidate) & $-0.6$ & $0.0594$ & --\\
+\midrule
+ & & & & $0.1196$ & $-0.8$\\
+\bottomrule
+\end{tabular}
+\end{center}
+$Z=(99-100)^+=0$, so $\PL_T=p_0-0.8-0.1196=p_0-0.9196$.
+
+Use this exact example as a unit test for the rollout (Section~\ref{sec:impl}).
+\end{example}
+
+\subsection{How the gradient flows}
+
+Differentiating~\eqref{eq:PL} with respect to a single position $\delta_k$ (scalar case, holding the other positions fixed):
+\[
+\frac{\partial\PL_T}{\partial\delta_k}
+=\underbrace{(S_{k+1}-S_k)}_{\text{gain}}
+\;-\;\underbrace{c\,S_k\sgn(\delta_k-\delta_{k-1})}_{\text{cost of trading into }\delta_k}
+\;+\;\underbrace{c\,S_{k+1}\sgn(\delta_{k+1}-\delta_k)}_{\text{cost of trading out of }\delta_k}.
+\]
+Two features of this formula explain the behavior of the trained hedger:
+\begin{itemize}[leftmargin=*]
+  \item The cost terms are $\pm cS$, independent of the trade size. Small adjustments pay a cost of first order, while the
+        risk reduction they buy is second order. This is where the no-trade band (Section~\ref{sec:band}) comes from.
+  \item There is also an \emph{indirect} path: $\delta_k$ is an input to $F_\theta$ at step $k+1$, so it changes $\delta_{k+1}$, which
+        changes later gains and costs. Autograd follows this chain automatically, exactly as in a recurrent network.
+\end{itemize}
+The chain from $\PL_T$ back to $\theta$ passes through all $n$ network calls. It breaks if anything inside the
+rollout calls \texttt{.item()}, \texttt{.numpy()}, \texttt{.detach()}, or runs under \texttt{torch.no\_grad()}.
+The kink of $|\cdot|$ at $0$ is not a problem: autograd uses the subgradient $0$ there.
+
+\subsection{The algorithm}
+
+\begin{algorithm}[H]
+\caption{Deep hedging (training)}
+\begin{algorithmic}[1]
+\Require simulator, payoff $Z(\cdot)$, cost rate $c$, risk measure $\hat\rho$, batch size $B$, steps $N$
+\State Initialize network $F_\theta$; for CVaR also $w\leftarrow0$
+\State Simulate a fixed test set of paths (fixed seed)
+\For{$j=1,\dots,N$}
+  \State Simulate $B$ fresh paths $S^{(i)}_{0:n}$ (and $V^{(i)}_{0:n}$)
+  \State $\PL\leftarrow-Z(S_{0:n})$;\quad $\delta_{\text{prev}}\leftarrow0$
+  \For{$k=0,\dots,n-1$}
+    \State $I_k\leftarrow\texttt{features}(S_k,V_k,t_k,\delta_{\text{prev}})$ \Comment{shape $(B,d)$}
+    \State $\delta_k\leftarrow F_\theta(I_k)$ \Comment{shape $(B,m)$}
+    \State $\PL\leftarrow\PL+\delta_k\cdot(S_{k+1}-S_k)-c\,S_k\cdot|\delta_k-\delta_{\text{prev}}|$
+    \State $\delta_{\text{prev}}\leftarrow\delta_k$
+  \EndFor
+  \State $\PL\leftarrow\PL-c\,S_n\cdot|\delta_{\text{prev}}|$
+  \State $\text{loss}\leftarrow\hat\rho(\PL)$
+  \State Backpropagate; Adam step on $(\theta,w)$
+  \If{$j$ is a multiple of the evaluation interval}
+    \State Evaluate on the test set (no gradient); log metrics; compare with benchmarks
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Cost per step.} $B\cdot n$ forward passes of a network with a few thousand parameters. With
+$B=10^4$ and $n=30$, one step takes milliseconds on a laptop CPU, and a full run takes minutes.
+
+%====================================================================
+\section{Market Simulators}\label{sec:sim}
+%====================================================================
+
+\subsection{Geometric Brownian motion}
+
+With $r=0$ and $\mathbb P=\mathbb Q$ (drift $0$), sample exactly:
+\[
+S_{k+1}=S_k\exp\Bigl(-\tfrac12\sigma^2\Delta t+\sigma\sqrt{\Delta t}\,\varepsilon_k\Bigr),\qquad \varepsilon_k\overset{\text{iid}}{\sim}N(0,1).
+\]
+There is no discretization error, because the log-price increments are exactly Gaussian.
+This is the sanity-check model: the answer (BS delta) is known.
+
+\begin{remark}[Why zero drift]
+If $\mu\neq0$, the quadratic-optimal discrete hedge is not the BS delta (it includes a correction from the mean of
+$\Delta S$), and the network will learn to exploit the drift. With $\mu=0$, $S$ is a martingale, and the
+variance-optimal hedge converges to the BS delta as $\Delta t\to0$. This gives a clean test.
+\end{remark}
+
+\subsection{Heston}
+
+\paragraph{Dynamics} (zero rate, risk-neutral; this is the parametrization in the repo):
+\[
+dS_t=S_t\sqrt{V_t}\,dB_t,\qquad dV_t=\alpha(b-V_t)\,dt+\sigma\sqrt{V_t}\,dW_t,\qquad d\langle B,W\rangle_t=\rho\,dt.
+\]
+Parameters from the paper: $\alpha=1$, $b=0.04$, $\rho=-0.7$, $\sigma=2$, $V_0=0.04$, $S_0=100$,
+$n=30$ daily steps.
+
+\paragraph{Discretization: full-truncation Euler} with substep $h$, writing $V^+=\max(V,0)$:
+\begin{align*}
+S_{t+h}&=S_t\exp\Bigl(-\tfrac12V_t^+h+\sqrt{V_t^+h}\,Z^S\Bigr),\\
+V_{t+h}&=V_t+\alpha(b-V_t^+)h+\sigma\sqrt{V_t^+h}\,Z^V,\qquad Z^S=\rho Z^V+\sqrt{1-\rho^2}\,Z^\perp .
+\end{align*}
+\textbf{Feller condition:} $2\alpha b\ge\sigma^2$ guarantees $V>0$. Here $2\alpha b=0.08\ll\sigma^2=4$, so
+$V$ hits $0$ often and discretization error is not negligible. Keep the substeps (the repo uses $10$ per day), and mention it in the report.
+
+\subsection{The variance swap as a second instrument}
+
+To hedge volatility risk we need a traded instrument that depends on $V$. Take the variance swap whose
+value is the conditional expected realized variance:
+\[
+S^{(2)}_t=\E\Bigl[\int_0^TV_s\,ds\,\Big|\,\mathcal F_t\Bigr]=\int_0^tV_s\,ds+L(t,V_t).
+\]
+By construction $S^{(2)}$ is a $\mathbb Q$-martingale (a conditional expectation of one fixed random variable),
+so it is a legitimate zero-rate price process.
+
+\begin{proposition}
+$\displaystyle L(t,v)=\frac{v-b}{\alpha}\bigl(1-e^{-\alpha(T-t)}\bigr)+b\,(T-t)$.
+\end{proposition}
+
+\begin{proof}
+Taking expectations in the variance SDE (the stochastic integral has mean zero) gives the ODE
+$\frac{d}{ds}\E[V_s\mid V_t]=\alpha\bigl(b-\E[V_s\mid V_t]\bigr)$, so
+$\E[V_s\mid V_t=v]=b+(v-b)e^{-\alpha(s-t)}$. By Fubini,
+\[
+L(t,v)=\int_t^T\Bigl(b+(v-b)e^{-\alpha(s-t)}\Bigr)ds=b(T-t)+\frac{v-b}{\alpha}\bigl(1-e^{-\alpha(T-t)}\bigr). \qedhere
+\]
+\end{proof}
+
+\paragraph{Scaling.} $S^{(1)}\approx100$ while $S^{(2)}\approx bT=0.04\cdot30/365\approx0.0033$. Positions in the
+second instrument will therefore be numerically large: roughly $\partial_vC/\partial_vL$, where $\partial_vL=(1-e^{-\alpha\tau})/\alpha\approx\tau$.
+Either rescale the instrument (quote it per unit of $bT$) or let the network output a scaled position.
+Otherwise the network barely learns the second instrument.
+
+%====================================================================
+\section{Benchmarks and What to Expect}\label{sec:bench}
+%====================================================================
+
+\subsection{GBM without costs: recover the BS delta}
+
+With $\sigma$ known and $r=0$, $\tau=T-t$:
+\[
+d_1=\frac{\log(S/K)+\tfrac12\sigma^2\tau}{\sigma\sqrt\tau},\qquad \Delta^{BS}=N(d_1),\qquad
+C^{BS}=S\,N(d_1)-K\,N(d_1-\sigma\sqrt\tau).
+\]
+\begin{example}
+$S=105$, $K=100$, $\tau=10/365$, $\sigma=0.2$:
+$d_1=\frac{0.04879+0.00055}{0.2\cdot0.16552}=1.490$, so $\Delta^{BS}=N(1.490)\approx0.932$.
+The trained network at input $(\log1.05,\ 10/365)$ should output approximately $0.93$.
+\end{example}
+
+\textbf{Pass criterion (M0).} Plot $\delta_k$ against $S_k$ at a few fixed $t_k$, with $N(d_1)$ on top. The curves should
+overlap, and the P\&L standard deviation of the network hedge should be close to that of the BS delta hedge. If not,
+there is a bug. No experiment beyond this point is meaningful until M0 passes.
+
+\subsection{GBM with costs: the no-trade band}\label{sec:band}
+
+From the gradient formula in Section~\ref{sec:dh}: a small trade costs $cS|\Delta\delta|$ (first order), while the
+hedging-error reduction it buys is second order in the deviation. So it is optimal \emph{not} to trade while the
+position is close enough to the frictionless target, and when it drifts outside, to trade only back to the
+\emph{edge} of the band.
+
+\paragraph{Whalley--Wilmott asymptotics.} For exponential utility with risk aversion $\gamma$ and small $c$, the
+optimal band is approximately
+\[
+\delta\in\bigl[\Delta^{BS}-H,\ \Delta^{BS}+H\bigr],\qquad
+H=\Bigl(\frac{3\,c\,S\,\Gamma^2}{2\gamma}\Bigr)^{1/3},\qquad \Gamma=\frac{N'(d_1)}{S\sigma\sqrt\tau}.
+\]
+Qualitative predictions to check against the network:
+\begin{itemize}[leftmargin=*]
+  \item width scales like $c^{1/3}$, not $c$;
+  \item the band is widest where $\Gamma$ is large: near the money and close to expiry;
+  \item plotting $\delta_k$ against $\delta_{k-1}$ (other inputs fixed) shows a flat-then-diagonal-then-flat shape: inside the band the output equals the input (no trade).
+\end{itemize}
+These are asymptotic results for continuous trading. The network trades discretely and uses CVaR, so expect
+agreement in shape, not exact numbers.
+
+\subsection{Heston}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Spot only.} Benchmark: BS delta evaluated with the current volatility $\sqrt{V_k}$. Vol risk is unhedged, so the P\&L
+        has fat tails and the network should beat the benchmark mainly in the tail.
+  \item \textbf{Spot plus variance swap.} The market is (approximately) complete in continuous time. The model hedge is
+        \[
+        \delta^{(1)}=\partial_SC^{H},\qquad \delta^{(2)}=\frac{\partial_vC^{H}}{\partial_vL}=\frac{\alpha\,\partial_vC^{H}}{1-e^{-\alpha(T-t)}},
+        \]
+        with $C^H(t,S,v)$ the Heston call price (computable with Carr--Madan). Expect a large reduction in CVaR compared with spot only.
+\end{itemize}
+
+\subsection{Indifference price}
+
+With $c=0$ in GBM, $p_0$ should be close to $C^{BS}$, up to discrete-hedging error. With $c>0$, $p_0>C^{BS}$:
+the excess is the compensation for costs and residual risk, and it increases with $c$ and with risk aversion.
+
+%====================================================================
+\section{Experiments and Evaluation}\label{sec:exp}
+%====================================================================
+
+\begin{center}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}llll@{}}
+\toprule
+ID & Model & Objective & Question\\
+\midrule
+M0 & GBM, $c=0$ & quadratic & Does the network recover $N(d_1)$?\\
+M1 & GBM, $c=0$ & $\CVaR_{0.95}$ & Same hedge? Better tail?\\
+M2 & GBM, $c\in\{0.05,0.1,0.5\}\%$ & $\CVaR_{0.95}$ & No-trade band; beats BS delta?\\
+M3 & Heston, spot only & $\CVaR_{0.95}$ & Gain over BS delta with $\sqrt{V_k}$\\
+M4 & Heston, spot + var swap & $\CVaR_{0.95}$ & Tail reduction vs.\ M3\\
+P & any & $\CVaR_{0.95}$ & Indifference price $\pi(-Z)-\pi(0)$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Metrics} (always on the fixed test set, for both network and benchmark):
+mean, standard deviation, $\CVaR_{0.95}$ of $\PL_T$; average turnover $\E\sum_k|\delta_k-\delta_{k-1}|$; total cost $\E[C_T]$;
+indifference price.
+
+\paragraph{Plots.} P\&L histograms (network vs.\ benchmark, overlaid); $\delta$ vs.\ $S$ at fixed $t_k$; $\delta_k$ vs.\ $\delta_{k-1}$ for the band;
+training curve (train loss and test loss).
+
+\paragraph{Reliability.} Run 3--5 seeds and report the spread. Use batch size $\ge10^4$ for $\CVaR_{0.95}$, so that each batch has at least 500 tail paths.
+
+%====================================================================
+\section{Implementation Guide}\label{sec:impl}
+%====================================================================
+
+\subsection{Repository map}
+
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}lll@{}}
+\toprule
+File & Content & Notes section\\
+\midrule
+\texttt{market/simulators.py} & GBM, Heston + variance swap & \ref{sec:sim}\\
+\texttt{market/pricing.py} & BS price/delta/gamma (Heston via Carr--Madan, optional) & \ref{sec:bench}\\
+\texttt{liabilities.py} & payoffs $Z(S_{0:n})$ & 1\\
+\texttt{features.py} & state $I_k$, normalized & \ref{sec:dh}\\
+\texttt{model.py} & MLP policy $F_\theta$ & \ref{sec:nn}\\
+\texttt{frictions.py} & cost $c\,S_k\cdot|\delta_k-\delta_{k-1}|$ & 1\\
+\texttt{objectives.py} & quadratic, entropic, CVaR with learnable $w$ & \ref{sec:risk}\\
+\texttt{train.py} & rollout, training loop, evaluation & \ref{sec:dh}\\
+\texttt{benchmarks.py} & BS delta, BS with $\sqrt{V_k}$, Whalley--Wilmott band & \ref{sec:bench}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Interfaces}
+
+$B$ = number of paths, $n$ = time steps, $m$ = instruments, $d$ = features.
+\begin{center}\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Function & Returns\\
+\midrule
+\texttt{simulate(..., generator)} & dict: \texttt{S} (B,n+1,m), \texttt{V} (B,n+1), \texttt{T}, \texttt{dt}\\
+\texttt{payoff(S)} & \texttt{(B,)}\\
+\texttt{features(S, V, k, delta\_prev, cfg)} & \texttt{(B,d)}\\
+\texttt{policy(I)} & \texttt{(B,m)}\\
+\texttt{cost(delta, delta\_prev, S\_k)} & \texttt{(B,)}\\
+\texttt{rho(PL)} & scalar\\
+\texttt{hedge\_pnl(policy, paths, payoff, cost)} & \texttt{(B,)}\\
+\bottomrule
+\end{tabular}
+\end{center}
+The benchmarks implement the same \texttt{policy} signature as the network, so one \texttt{hedge\_pnl} evaluates both.
+This guarantees the comparison uses identical P\&L accounting.
+
+\subsection{Tests}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Simulator (GBM).} Monte Carlo call price within 3 standard errors of $C^{BS}$.
+  \item \textbf{Simulator (Heston).} $\E[S^{(2)}_n]\approx S^{(2)}_0$ (martingale), and $\E[S^{(1)}_n]\approx S_0$.
+  \item \textbf{Rollout.} The two-step example of Section~\ref{sec:dh}: a constant policy returning $0.5$ then $0.6$ on the
+        path $100\to102\to99$ gives $\PL_T=p_0-0.9196$.
+  \item \textbf{Benchmark.} BS delta hedge, GBM, $c=0$: P\&L standard deviation decreases roughly like $1/\sqrt n$ as $n$ grows.
+  \item \textbf{Objectives.} The CVaR example of Section~\ref{sec:risk}: losses $\{-1,0,2,3,6\}$, $\alpha=0.6$, value $4.5$.
+\end{enumerate}
+
+\subsection{Debugging checklist}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Shapes.} \texttt{(B,1)} minus \texttt{(B,)} broadcasts silently to \texttt{(B,B)}. Squeeze or keep \texttt{(B,m)} consistently and assert shapes.
+  \item \textbf{Gradient chain.} No \texttt{.item()}, \texttt{.numpy()}, \texttt{.detach()}, or \texttt{no\_grad} inside the rollout. Call \texttt{optimizer.zero\_grad()} every step.
+  \item \textbf{Loss flat.} Check input scaling, then lower the learning rate. Plot $\delta$ vs.\ $S$: a constant output means the network is not using its inputs.
+  \item \textbf{Off-by-one.} $S$ has $n+1$ dates; $\delta$ has $n$. The liquidation cost uses $S_n$.
+  \item \textbf{Large $c$.} The network may learn ``never trade''. Compare with the benchmark CVaR before calling it a bug; it can be optimal.
+  \item \textbf{Tail noise.} CVaR loss jumps around: increase $B$.
+\end{itemize}
+
+%====================================================================
+\section{Limitations and Extensions}
+%====================================================================
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{In-model results.} Training and testing on the same simulator flatters the method. The real question is performance when the
+        simulator is wrong: train on Heston, test on rough volatility or on bootstrapped historical paths.
+  \item \textbf{European payoffs, $r=0$.} American options need $r>0$ (otherwise early exercise of a put is never optimal) and a model of the holder's
+        exercise rule; the liability is then settled at a random time.
+  \item \textbf{No uniqueness.} Different seeds can give different strategies with similar risk, especially with costs, where the objective is flat near the optimum.
+  \item \textbf{Choice of $\rho$.} Results depend on $\alpha$ and $\lambda$. Report them, and ideally show sensitivity.
+\end{itemize}
+
+%====================================================================
+\begin{thebibliography}{9}
+\bibitem{buehler} H.~Buehler, L.~Gonon, J.~Teichmann, B.~Wood. Deep hedging. \emph{Quantitative Finance} 19(8), 2019.
+\bibitem{ru} R.~T.~Rockafellar, S.~Uryasev. Optimization of conditional value-at-risk. \emph{Journal of Risk} 2(3), 2000.
+\bibitem{ww} A.~E.~Whalley, P.~Wilmott. An asymptotic analysis of an optimal hedging model for option pricing with transaction costs. \emph{Mathematical Finance} 7(3), 1997.
+\bibitem{hornik} K.~Hornik. Approximation capabilities of multilayer feedforward networks. \emph{Neural Networks} 4(2), 1991.
+\bibitem{adam} D.~P.~Kingma, J.~Ba. Adam: a method for stochastic optimization. ICLR, 2015.
+\bibitem{fs} H.~F\"ollmer, A.~Schied. \emph{Stochastic Finance: An Introduction in Discrete Time}. De Gruyter, 4th ed., 2016.
+\end{thebibliography}
+
+\end{document}
