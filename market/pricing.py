@@ -12,7 +12,7 @@ def _to_tensor(x):
     """Convert floats/ints to a float tensor """
     if isinstance(x, torch.Tensor):
         return x
-    return torch.as_tensor(x, dtype=torch.get_default_dtype())
+    return torch.as_tensor(x, dtype=torch.float64)
 
 
 def _d1_d2(S, K, tau, sigma):
