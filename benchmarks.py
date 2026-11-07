@@ -1,14 +1,14 @@
 """ Benchmark hedging strategies for comparison study with deep hedging
 
-Two strategies used as benchmark: constant policy, bs_delta policy
+3 strategies used as benchmark: constant policy, bs_delta policy, ww_band_policy
 """
 
 import torch
-from market.pricing import bs_delta
+from market.pricing import bs_delta, bs_gamma
 
 def constant_policy(a):
     """Constant longing/shorting for one instrument for all paths on day k"""
-    def policy(S_k, tau_k):
+    def policy(S_k, tau_k, delta_prev):
         """
         S_k:    vector of length B, the price of instrument for all paths on day k
         tau_k:  time to maturity, measured in years
@@ -19,8 +19,28 @@ def constant_policy(a):
 
 def bs_delta_policy(K, sigma):
     """BS delta hedge, assuming 0 interest rate and known volatility"""
-    def policy(S_k, tau_k):
+    def policy(S_k, tau_k, delta_prev):
         return bs_delta(S_k, K, tau_k, sigma)
+    return policy
+
+
+def ww_band_policy(K, sigma, c, gamma):
+    """Whalley-Wilmott band hedging method with transaction cost
+
+    Proposed in the paper in 1997, the primary idea is "only change the holding
+    when too far off" to avoid frequent trading that brings high transactions. 
+
+    The extent of "how far off" is compared with the band
+        H_k = ((3c * S_k * Gamma_k^2) / (2 * gamma))^(1/3)
+    where gamma is the risk aversion coefficient. 
+    """
+    def policy(S_k, tau_k, delta_prev):
+        Gamma_k = bs_gamma(S_k, K, tau_k, sigma)
+        H_k = ((3 * c * S_k * Gamma_k ** 2) / (2 * gamma)) ** (1 / 3)
+        bs_delta_k = bs_delta(S_k, K, tau_k, sigma)
+
+        return torch.clamp(delta_prev, min = bs_delta_k - H_k, max = bs_delta_k + H_k)
+
     return policy
 
 
@@ -48,7 +68,7 @@ def hedge_pnl(S, policy, K, T, c = 0.0, p0 = 0.0):
     for k in range(n):
         S_k = S[:, k]
         tau_k = T - k * dt
-        delta = policy(S_k, tau_k)
+        delta = policy(S_k, tau_k, delta_prev)
         pnl = pnl + delta * (S[:, k+1] - S_k) - c * (delta - delta_prev).abs() * S_k
         delta_prev = delta
     
