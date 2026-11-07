@@ -4,3 +4,4 @@ matplotlib
 pytest
 seaborn
 pandas
+scipy
