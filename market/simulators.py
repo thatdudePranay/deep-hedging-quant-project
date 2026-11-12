@@ -25,7 +25,7 @@ def simulate_heston(
     n_paths: int,
     n_steps: int = 30,
     dt: float = 1 / 365,
-    params: HestonParams = HestonParams(),
+    params: HestonParams | None = None,
     substeps: int = 10,
     device: str = "cpu",
 ):
@@ -33,7 +33,7 @@ def simulate_heston(
         S : (n_paths, n_steps+1, 2)  hedging instruments [spot, variance swap]
         V : (n_paths, n_steps+1)     instantaneous variance (a feature)
     """
-    p = params
+    p = params or HestonParams()
     T = n_steps * dt
     h = dt / substeps
 
@@ -68,3 +68,17 @@ def simulate_heston(
 def call_payoff(S, strike: float):
 ## European call on the spot (instrument 0). we shud replace with any G(S_0..S_T)
     return torch.clamp(S[:, -1, 0] - strike, min=0.0)
+
+
+
+def simulate_gbm(n_paths, n_steps=30, dt=1/365, sigma=0.2, s0=100.0, device="cpu"):
+    z = torch.randn(n_paths, n_steps, device=device)
+    log_ret = -0.5 * sigma**2 * dt + sigma * math.sqrt(dt) * z
+    zero = torch.zeros(n_paths, 1, device=device)
+    # log price at each date
+    log_s = torch.cat([zero, log_ret.cumsum(dim=1)], dim=1)      
+    S = (s0 * torch.exp(log_s)).unsqueeze(-1)     
+    # constant variance              
+    V = torch.full((n_paths, n_steps + 1), sigma**2, device=device)  
+    return {"S": S, "V": V, "T": n_steps * dt, "dt": dt}
+
