@@ -61,6 +61,7 @@ def bs_gamma(S, K, tau, sigma):
 
 import numpy as np
 from scipy.integrate import quad
+from market.simulators import HestonParams
 
 
 def heston_cf(u, T, v0, kappa, theta, xi, rho):
@@ -83,7 +84,7 @@ def heston_cf(u, T, v0, kappa, theta, xi, rho):
     return np.exp(C + D * v0)
 
 
-def heston_price(K, T, params=None, upper=200.0):
+def heston_price(K, T, params=None, upper=None):
     """European call price under Heston, r = 0, via Lewis' single-integral formula:
 
         C = S0 - sqrt(S0 K) / pi * int_0^inf Re[ e^{i u log(S0/K)} phi(u - i/2) ] / (u^2 + 1/4) du
@@ -95,14 +96,90 @@ def heston_price(K, T, params=None, upper=200.0):
     Checks: phi(0) = 1, and as params.sigma -> 0 with v0 = b the price converges to the
     BS price with volatility sqrt(v0).
     """
-    from market.simulators import HestonParams
+
     p = HestonParams() if params is None else params
     S0 = p.s0
     k = np.log(S0 / K)
+    if upper is None:
+        upper = min(60.0 / math.sqrt(T * p.b), 5000.0)
 
     def integrand(u):
         phi = heston_cf(u - 0.5j, T, v0=p.v0, kappa=p.alpha, theta=p.b, xi=p.sigma, rho=p.rho)
         return np.real(np.exp(1j * u * k) * phi) / (u**2 + 0.25)
 
-    integral, _ = quad(integrand, 0.0, upper, limit=500)
+    integral, _ = quad(integrand, 0.0, upper, limit=2000)
     return float(S0 - np.sqrt(S0 * K) / np.pi * integral)
+
+
+def heston_greeks(S, v, tau, K, params=None, N=512):
+    """Vectorized Heston call price, delta and vega (r = 0) for a whole batch of states.
+
+    Same Lewis formula as `heston_price`,
+
+        C = S - sqrt(SK)/pi * I,    I = int_0^inf Re[e^{iuk} phi(u - i/2)] / (u^2 + 1/4) du,
+        k = log(S/K),               phi = exp(C(u) + D(u) v),
+
+    but the integral is replaced by a fixed Gauss-Legendre rule on [0, U], shared by all
+    states. C(u), D(u) depend only on u and tau, so they are computed once; each state
+    (S_i, v_i) enters only through k_i and v_i, so all integrands form one (B, N) matrix
+    E_ij = exp(i u_j k_i + C(u_j) + D(u_j) v_i), and each integral is a matrix-vector product.
+
+    Greeks are obtained by differentiating under the integral sign:
+        dI/dk = int Re[iu e^{iuk} phi] / (u^2 + 1/4) du,
+        dI/dv = int Re[D(u - i/2) e^{iuk} phi] / (u^2 + 1/4) du,
+        delta = dC/dS = 1 - (1/pi) sqrt(K/S) (I/2 + dI/dk),
+        vega  = dC/dv = -sqrt(SK)/pi * dI/dv      (sensitivity to the variance v, not to sqrt(v)).
+
+    S, v:    tensors of shape (B,): current spot and instantaneous variance of each path
+             (v is clamped at 0, since the simulator can produce slightly negative values)
+    tau:     float, time to maturity T - t_k in years (> 0); the same for all paths on a date
+    K:       strike
+    params:  HestonParams from market.simulators (alpha, b, sigma, rho are used;
+             s0 and v0 are ignored, the current state is given by S and v). Defaults to HestonParams().
+    N:       number of quadrature nodes
+
+    The truncation point U grows like 1/sqrt(tau): close to maturity the integrand decays
+    slowly, and a fixed U = 200 would give errors of order sqrt(SK)/(pi U) ~ 0.16.
+
+    Returns: (price, delta, vega), each a tensor of shape (B,) with the dtype of S.
+    """
+    p = HestonParams() if params is None else params
+    kappa, theta, xi, rho = p.alpha, p.b, p.sigma, p.rho      # simulator names -> formula names
+
+    ## torch -> numpy (float64), clamp negative variances
+    S_np = S.detach().double().numpy()
+    v_np = np.clip(v.detach().double().numpy(), 0.0, None)
+
+    ## points and weights on [-1, 1], mapped to [0, U]; U grows as tau shrinks
+    U = min(60.0 / math.sqrt(tau * theta), 5000.0)
+    x, w = np.polynomial.legendre.leggauss(N)
+    u = U * (x + 1) / 2
+    wu = w * U / 2 ## new weights for u
+
+    ## first deal with C(u), D(u) since they are indep from the state
+    z = u - 0.5j
+    beta = kappa - rho * xi * 1j * z
+    d = np.sqrt(beta**2 + xi**2 * (1j * z + z**2))
+    g = (beta - d) / (beta + d)
+    e = np.exp(-d * tau)
+    Cu = kappa * theta / xi**2 * ((beta - d) * tau - 2 * np.log((1 - g * e) / (1 - g)))
+    Du = (beta - d) / xi**2 * (1 - e) / (1 - g * e)
+
+    ## The integrand at all states, E_ij = exp(i u_j k_i + C(u_j) + D(u_j) v_i), shape (B, N)
+    k = np.log(S_np / K)[:, None] #(B, 1)
+    E = np.exp(1j * u[None, :] * k + Cu[None, :] + Du[None, :] * v_np[:, None])
+    den = u ** 2 + 0.25
+
+    ## The B integration can be solved by matrix multiplication
+    I = (np.real(E) / den) @ wu
+    ## assuming smoothness so interchange differentiation and integration
+    Ik = (np.real(1j * u[None, :] * E) / den) @ wu
+    Iv = (np.real(Du[None, :] * E) / den) @ wu
+
+    ## Calculate the greeks and prices
+    price = S_np - np.sqrt(S_np * K) / np.pi * I
+    delta = 1 - np.sqrt(K / S_np) / np.pi * (0.5 * I + Ik)
+    vega = - np.sqrt(S_np * K) / np.pi * Iv
+
+    to_tensor = lambda a: torch.as_tensor(a, dtype=S.dtype, device=S.device)
+    return to_tensor(price), to_tensor(delta), to_tensor(vega)
