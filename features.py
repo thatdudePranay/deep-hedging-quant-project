@@ -36,11 +36,23 @@ def nn_policy(model, K, T, use_prev = False, s_scale = 1.0):
 
 
 def ntb_policy(model, K, T, sigma, s_scale = 1.0):
-    """Wrap a network as a policy(S_k, tau_k, delta_prev V_k) -> delta_k.
-    Different from nn_policy, we do not directly pass delta_prev
-    but consider a no-transaction-band like WW-policy.
+    """No-transaction-band policy: policy(S_k, tau_k, delta_prev, V_k) -> delta_k.
 
-    model:    output must have d_in = d_out = 2
+    The network does not output the position. It outputs the band around the
+    BS delta, and the position is obtained by clamping the previous holding:
+
+        lo = Delta_BS(S, tau) - softplus(o1),   hi = Delta_BS(S, tau) + softplus(o2),
+        delta_k = clamp(delta_prev, lo, hi).
+
+    Inside the band nothing is traded; outside, trade only back to the nearest edge
+    (same rule as ww_band_policy, but the two widths are learned and may differ).
+    delta_prev is not a network input, it is only used in the clamp.
+
+    model:    network with d_in = 2 (log-moneyness, time) and m_out = 2 (o1, o2).
+              Initialize the last bias to about -3 so the initial band is narrow;
+              a wide initial band contains delta_prev = 0, no trade happens and the
+              gradient is zero.
+    sigma:    volatility used for the BS delta at the centre of the band
     s_scale:  normalization for log(S/K); must be the same value at
               training and evaluation time.
     """

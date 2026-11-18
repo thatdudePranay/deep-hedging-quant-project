@@ -71,6 +71,18 @@ def call_payoff(S, strike: float):
 
 ## Geometric Brownian Motion
 def simulate_gbm(n_paths, n_steps = 30, dt = 1/365, sigma = 0.2, S_init = 100):
+    """Simulate GBM stock paths with zero drift (r = 0), exact in distribution:
+
+        S_{k+1} = S_k * exp(-sigma^2 dt / 2 + sigma sqrt(dt) Z_k),   Z_k iid N(0, 1).
+
+    n_paths, n_steps, dt: number of paths, number of steps, step size (years)
+    sigma, S_init:        volatility and initial price
+
+    Returns a dict (same layout as simulate_heston, with one instrument):
+        "S":  (n_paths, n_steps+1, 1) stock paths, S[:, 0, 0] = S_init
+        "V":  (n_paths, n_steps+1)    variance, constant sigma^2
+        "dt": dt,   "T": n_steps * dt
+    """
     Z = torch.randn((n_paths, n_steps))
     incre = torch.cumsum(- sigma ** 2 * dt / 2 + sigma * dt ** 0.5 * Z, dim = 1)
 
