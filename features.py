@@ -4,14 +4,22 @@ from market.pricing import bs_delta
 def make_features(S_k, tau_k, delta_prev, K, T, s_scale=1.0, V_k=None, v_scale=0.04):
     """Build the network input at date k.
 
-    Features (last dim):
+    Features (last dim, in this order):
         log(S_k / K) / s_scale   -- moneyness, normalized so it is O(1)
         tau_k / T                -- fraction of time to maturity remaining
-        delta_prev               -- previous position (only if not None)
+        delta_prev               -- previous position (only if delta_prev is not None)
+        V_k / v_scale            -- instantaneous variance, normalized (only if V_k is not None)
 
-    s_scale: typical size of log-moneyness moves, e.g. sigma * sqrt(T).
-             Default 1.0 = no normalization.
-    Returns a tensor of shape (B, 2) or (B, 3).
+    S_k:        (B,) stock price at date k
+    tau_k:      float, time to maturity T - t_k (years)
+    delta_prev: (B,) previous holding, or None to leave it out
+    K, T:       strike and maturity
+    s_scale:    typical size of log-moneyness moves, e.g. sigma * sqrt(T) under GBM,
+                sqrt(b * T) under Heston. Default 1.0 = no normalization.
+    V_k:        (B,) instantaneous variance at date k, or None to leave it out
+    v_scale:    typical size of the variance, e.g. the Heston long-run variance b
+
+    Returns a tensor of shape (B, 2), (B, 3) or (B, 4).
     """
     remain_t = torch.full_like(S_k, tau_k / T)
     features = [torch.log(S_k / K) / s_scale, remain_t]
@@ -21,23 +29,41 @@ def make_features(S_k, tau_k, delta_prev, K, T, s_scale=1.0, V_k=None, v_scale=0
         features.append(V_k / v_scale)
     return torch.stack(features, dim = -1)
 
-def nn_policy(model, K, T, use_prev=False, s_scale=1.0, use_var=False, v_scale=0.04):
+def nn_policy(model, K, T, use_prev=False, s_scale=1.0, use_var=False, v_scale=0.04, out_scale=1.0):
     """Wrap a network as a policy(S_k, tau_k, delta_prev, V_k) -> delta_k.
 
-    use_prev: feed delta_prev as a feature (needed with transaction costs;
-              model must then have d_in = 3).
-    s_scale:  normalization for log(S/K); must be the same value at
-              training and evaluation time.
+    The network maps the features of make_features to the position(s):
+        delta_k = model(features) * out_scale.
+
+    model:     network with d_in = 2 + use_prev + use_var and m_out = number of instruments
+    K, T:      strike and maturity
+    use_prev:  feed delta_prev as a feature (needed with transaction costs)
+    s_scale:   normalization for log(S/K)
+    use_var:   feed V_k / v_scale as a feature (stochastic volatility, e.g. Heston)
+    v_scale:   normalization for V_k, e.g. the Heston long-run variance b
+    out_scale: scale applied to the network output, so the network can work with O(1)
+               numbers while the positions are large; a float or a tensor of shape (m_out,),
+               e.g. torch.tensor([1.0, 100.0]) for stock + variance swap
+               (the variance-swap position is of order 100s)
+
+    s_scale, v_scale, out_scale (and use_prev, use_var) must be the same at training and
+    evaluation time; the easiest way is to keep them in one dict and pass it to both
+    train(...) and nn_policy(...).
+
+    Returns policy(S_k, tau_k, delta_prev, V_k) -> delta_k of shape (B,) if m_out = 1,
+    else (B, m_out).
     """
     def policy(S_k, tau_k, delta_prev, V_k = None):
         dp = delta_prev if use_prev else None
         var = V_k if use_var else None
         features = make_features(S_k, tau_k, dp, K, T, s_scale, var, v_scale)
-        delta = model(features)
+        delta = model(features) * out_scale
         return delta.squeeze(-1)
     return policy
 
 
+# TODO(Micky): fully understand the NTB policy -- why the band structure helps,
+#              the softplus widths, the bias initialization, and where the gradient flows.
 def ntb_policy(model, K, T, sigma, s_scale = 1.0):
     """No-transaction-band policy: policy(S_k, tau_k, delta_prev, V_k) -> delta_k.
 

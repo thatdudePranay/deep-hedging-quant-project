@@ -5,8 +5,8 @@ from market.simulators import simulate_gbm
 
 def train(model, K, T, loss_fn=None, policy=None, n_steps=2000, B=5000, lr=1e-3, c=0.0,
           use_prev=False, s_scale=1.0, sim_kwargs=None, print_every=100,
-          use_var=False, v_scale=0.04, simulator=simulate_gbm):
-    """Train a hedging network by simulating fresh GBM paths at every step.
+          use_var=False, v_scale=0.04, simulator=simulate_gbm, n_instr=1, out_scale=1.0):
+    """Train a hedging network by simulating fresh market paths at every step.
 
     Two modes, depending on loss_fn:
       * loss_fn=None (quadratic): minimize E[(PnL + p0)^2] jointly over the network
@@ -22,13 +22,25 @@ def train(model, K, T, loss_fn=None, policy=None, n_steps=2000, B=5000, lr=1e-3,
     K, T:       strike and maturity (years); T must equal n_steps * dt of the simulator
     loss_fn:    None (quadratic) or a risk-measure module from objectives.py
     policy:     optional policy(S_k, tau_k, delta_prev, V_k) built from `model`
-                (e.g. features.ntb_policy). If None, nn_policy(model, K, T, use_prev, s_scale)
+                (e.g. features.ntb_policy). If None, it is built as
+                nn_policy(model, K, T, use_prev, s_scale, use_var, v_scale, out_scale)
     n_steps:    number of gradient steps; B: paths per step; lr: learning rate of the network
-    c:          proportional transaction cost rate
+    c:          proportional transaction cost rate (applied to every instrument)
     use_prev:   feed delta_prev as a feature (only used when policy is None)
     s_scale:    normalization of log(S/K) (only used when policy is None)
-    sim_kwargs: extra keyword arguments for simulate_gbm (e.g. {"sigma": 0.3})
+    sim_kwargs: extra keyword arguments for the simulator
+                (e.g. {"sigma": 0.3} for GBM, {"params": HestonParams()} for Heston)
     print_every: print the loss every this many steps
+    use_var:    feed V_k / v_scale as a feature (only used when policy is None)
+    v_scale:    normalization of V_k (only used when policy is None)
+    simulator:  function(n_paths, **sim_kwargs) -> dict with "S" (B, n+1, d) and "V" (B, n+1),
+                e.g. simulate_gbm (default) or simulate_heston
+    n_instr:    number of hedging instruments: 1 = stock only (S[:, :, 0]),
+                otherwise all instruments of the simulator (Heston: stock + variance swap)
+    out_scale:  scale of the network output (only used when policy is None), see nn_policy
+
+    Note: s_scale, v_scale, out_scale, use_prev, use_var must be passed with the same values
+    to nn_policy when the trained model is evaluated.
 
     Returns a dict:
         "model":   the trained network (same object as the input)
@@ -41,7 +53,7 @@ def train(model, K, T, loss_fn=None, policy=None, n_steps=2000, B=5000, lr=1e-3,
     p0 = torch.nn.Parameter(torch.zeros(()))
 
     if policy is None:
-        policy = nn_policy(model, K, T, use_prev, s_scale, use_var, v_scale)
+        policy = nn_policy(model, K, T, use_prev, s_scale, use_var, v_scale, out_scale)
 
     if loss_fn is None: ## default quadratic loss
         opt = torch.optim.Adam([
@@ -57,7 +69,8 @@ def train(model, K, T, loss_fn=None, policy=None, n_steps=2000, B=5000, lr=1e-3,
     losses = []
     for step in range(n_steps):
         out = simulator(B, **sim_kwargs)
-        S, V = out['S'][:, :, 0], out['V']
+        V = out['V']
+        S = out['S'][:, :, 0] if n_instr == 1 else out['S']
 
         if loss_fn is None:
             pnl = hedge_pnl(S, policy, K, T, c=c, p0=p0, V=V)
