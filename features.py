@@ -1,7 +1,7 @@
 import torch
 from market.pricing import bs_delta
 
-def make_features(S_k, tau_k, delta_prev, K, T, s_scale=1.0):
+def make_features(S_k, tau_k, delta_prev, K, T, s_scale=1.0, V_k=None, v_scale=0.04):
     """Build the network input at date k.
 
     Features (last dim):
@@ -17,9 +17,11 @@ def make_features(S_k, tau_k, delta_prev, K, T, s_scale=1.0):
     features = [torch.log(S_k / K) / s_scale, remain_t]
     if delta_prev is not None:
         features.append(delta_prev)
+    if V_k is not None:
+        features.append(V_k / v_scale)
     return torch.stack(features, dim = -1)
 
-def nn_policy(model, K, T, use_prev = False, s_scale = 1.0):
+def nn_policy(model, K, T, use_prev=False, s_scale=1.0, use_var=False, v_scale=0.04):
     """Wrap a network as a policy(S_k, tau_k, delta_prev, V_k) -> delta_k.
 
     use_prev: feed delta_prev as a feature (needed with transaction costs;
@@ -29,7 +31,8 @@ def nn_policy(model, K, T, use_prev = False, s_scale = 1.0):
     """
     def policy(S_k, tau_k, delta_prev, V_k = None):
         dp = delta_prev if use_prev else None
-        features = make_features(S_k, tau_k, dp, K, T, s_scale)
+        var = V_k if use_var else None
+        features = make_features(S_k, tau_k, dp, K, T, s_scale, var, v_scale)
         delta = model(features)
         return delta.squeeze(-1)
     return policy

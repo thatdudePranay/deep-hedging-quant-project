@@ -4,7 +4,8 @@ from benchmarks import hedge_pnl
 from market.simulators import simulate_gbm
 
 def train(model, K, T, loss_fn=None, policy=None, n_steps=2000, B=5000, lr=1e-3, c=0.0,
-          use_prev=False, s_scale=1.0, sim_kwargs=None, print_every=100):
+          use_prev=False, s_scale=1.0, sim_kwargs=None, print_every=100,
+          use_var=False, v_scale=0.04, simulator=simulate_gbm):
     """Train a hedging network by simulating fresh GBM paths at every step.
 
     Two modes, depending on loss_fn:
@@ -40,9 +41,9 @@ def train(model, K, T, loss_fn=None, policy=None, n_steps=2000, B=5000, lr=1e-3,
     p0 = torch.nn.Parameter(torch.zeros(()))
 
     if policy is None:
-        policy = nn_policy(model, K, T, use_prev, s_scale)
+        policy = nn_policy(model, K, T, use_prev, s_scale, use_var, v_scale)
 
-    if loss_fn is None:
+    if loss_fn is None: ## default quadratic loss
         opt = torch.optim.Adam([
             {"params": model.parameters(), "lr": lr},
             {"params": [p0], "lr": 1e-2}
@@ -55,13 +56,14 @@ def train(model, K, T, loss_fn=None, policy=None, n_steps=2000, B=5000, lr=1e-3,
 
     losses = []
     for step in range(n_steps):
-        S = simulate_gbm(B, **sim_kwargs)["S"][:, :, 0]
+        out = simulator(B, **sim_kwargs)
+        S, V = out['S'][:, :, 0], out['V']
 
         if loss_fn is None:
-            pnl = hedge_pnl(S, policy, K, T, c=c, p0=p0)
+            pnl = hedge_pnl(S, policy, K, T, c=c, p0=p0, V=V)
             loss = (pnl ** 2).mean() ## default quadratic loss
         else:
-            pnl = hedge_pnl(S, policy, K, T, c=c, p0=0.0)
+            pnl = hedge_pnl(S, policy, K, T, c=c, p0=0.0, V=V)
             loss = loss_fn(pnl)
 
         ## Reporting
